@@ -243,8 +243,10 @@ if [ "$LLM_BACKEND" = "ollama" ]; then
     if [ -z "$LLM_MODEL" ]; then
         # Still nothing — ask the user
         say "  Could not auto-discover a multimodal model."
-        printf '  Enter an Ollama model name (or press Enter to skip): '
-        read -r LLM_MODEL
+        if [ -t 0 ] || [ -e /dev/tty ]; then
+            printf '  Enter an Ollama model name (or press Enter to skip): ' > /dev/tty
+            read -r LLM_MODEL < /dev/tty 2>/dev/null || LLM_MODEL=""
+        fi
     fi
 
     if [ -n "$LLM_MODEL" ]; then
@@ -289,8 +291,11 @@ if [ -z "$LLM_BACKEND" ]; then
 
     # Ask user for a HuggingFace model repo or GGUF URL
     say "  llama.cpp built. You need a GGUF model file."
-    printf '  Enter a HuggingFace repo (e.g. ggml-org/gemma-3-4b-it-GGUF) or GGUF URL: '
-    read -r MODEL_SOURCE
+    MODEL_SOURCE=""
+    if [ -t 0 ] || [ -e /dev/tty ]; then
+        printf '  Enter a HuggingFace repo (e.g. ggml-org/gemma-3-4b-it-GGUF) or GGUF URL: ' > /dev/tty
+        read -r MODEL_SOURCE < /dev/tty 2>/dev/null || MODEL_SOURCE=""
+    fi
 
     if [ -n "$MODEL_SOURCE" ]; then
         mkdir -p "$AGENT_DIR/models"
@@ -447,7 +452,9 @@ $facts
 # Sync memory to git (cross-device persistence)
 memory_sync() {
     if [ -d "$MEMORY_DIR/.git" ]; then
-        (cd "$MEMORY_DIR" && git add -A && git commit -m "memory: $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null && git push 2>/dev/null) &
+        # Avoid lock contention: skip if another sync is in progress
+        [ -f "$MEMORY_DIR/.git/index.lock" ] && return 0
+        (cd "$MEMORY_DIR" && git add -A && git commit -m "memory: $(date -u +%Y-%m-%dT%H:%M:%SZ)" && git push 2>/dev/null) > /dev/null 2>&1 &
     fi
 }
 
@@ -916,8 +923,33 @@ exec_tool() {
 # --- Parse action from LLM response ---
 parse_action() {
     local response="$1"
-    # Extract JSON between ```action and ``` (portable awk, works on BSD+GNU)
-    printf '%s' "$response" | awk '/```action/{found=1;next} /```/{if(found)exit} found{print}' | jq '.' 2>/dev/null
+    local extracted
+
+    # Strategy 1: Extract JSON between ```action and ```
+    extracted=$(printf '%s' "$response" | awk '/```action/{found=1;next} /```/{if(found)exit} found{print}')
+    if [ -n "$extracted" ]; then
+        printf '%s' "$extracted" | jq '.' 2>/dev/null && return
+    fi
+
+    # Strategy 2: Extract JSON between ```json and ```
+    extracted=$(printf '%s' "$response" | awk '/```json/{found=1;next} /```/{if(found)exit} found{print}')
+    if [ -n "$extracted" ]; then
+        printf '%s' "$extracted" | jq '.' 2>/dev/null && return
+    fi
+
+    # Strategy 3: Find any JSON object with "tool" key in the response
+    extracted=$(printf '%s' "$response" | grep -o '{[^}]*"tool"[^}]*}' | head -1)
+    if [ -n "$extracted" ]; then
+        printf '%s' "$extracted" | jq '.' 2>/dev/null && return
+    fi
+
+    # Strategy 4: Find nested JSON (tool + args) — handles multi-line
+    extracted=$(printf '%s' "$response" | awk 'BEGIN{RS=""; FS=""} {match($0, /\{[^{}]*"tool"[^{}]*\}/, a); if(a[0]) print a[0]}')
+    if [ -n "$extracted" ]; then
+        printf '%s' "$extracted" | jq '.' 2>/dev/null && return
+    fi
+
+    echo ""
 }
 
 # --- Build system prompt based on capabilities ---
@@ -937,10 +969,18 @@ build_system_prompt() {
 You are Autonomos, an autonomous multimodal agent running locally. OS: $os. Arch: $arch.
 Modalities: $modalities.
 
-You execute actions by responding with:
+You MUST respond with EXACTLY ONE action block. Format:
+\`\`\`action
+{"tool": "<tool_name>", "args": {<arguments>}}
+\`\`\`
+
+Example:
 \`\`\`action
 {"tool": "shell", "args": {"command": "ls"}}
 \`\`\`
+
+NEVER respond with plain text. ALWAYS use the action block format above.
+If you want to communicate, use: {"tool": "done", "args": {"summary": "your message"}}
 
 Tools:
 - shell: {"command": "..."}
@@ -1165,11 +1205,19 @@ chmod 700 "$AGENT_DIR/secrets"
 # Create secrets file if it doesn't exist (never overwrite)
 if [ ! -f "$AGENT_DIR/secrets/identity.json" ]; then
     say "  First-time setup: configuring identity..."
-    printf '  Phone number for OTP/MFA (digits only, or Enter to skip): '
-    read -r OWNER_PHONE
-    printf '  Agent name [autonomos]: '
-    read -r AGENT_NAME
-    AGENT_NAME="${AGENT_NAME:-autonomos}"
+    OWNER_PHONE=""
+    AGENT_NAME="autonomos"
+
+    # Only prompt if we have a terminal (handles curl | sh case)
+    if [ -t 0 ] || [ -e /dev/tty ]; then
+        printf '  Phone number for OTP/MFA (digits only, or Enter to skip): ' > /dev/tty
+        read -r OWNER_PHONE < /dev/tty 2>/dev/null || OWNER_PHONE=""
+        printf '  Agent name [autonomos]: ' > /dev/tty
+        read -r AGENT_NAME < /dev/tty 2>/dev/null || AGENT_NAME="autonomos"
+        AGENT_NAME="${AGENT_NAME:-autonomos}"
+    else
+        say "  Non-interactive mode: using defaults. Edit ~/agent/secrets/identity.json later."
+    fi
 
     jq -n \
         --arg phone "${OWNER_PHONE:-}" \
@@ -1385,7 +1433,7 @@ if [ ! -d "$AGENT_DIR/memory/.git" ]; then
     say "    cd ~/agent/memory && git remote add origin <your-private-repo-url>"
 else
     say "  Memory repo exists. Pulling latest..."
-    (cd "$AGENT_DIR/memory" && git pull 2>/dev/null) >> "$LOG_FILE" 2>&1
+    (cd "$AGENT_DIR/memory" && git pull 2>/dev/null || true) >> "$LOG_FILE" 2>&1
 fi
 
 # ============================================================
