@@ -457,6 +457,139 @@ memory_init() {
     [ -f "$JOURNAL" ] || touch "$JOURNAL"
     [ -f "$LEARNINGS" ] || touch "$LEARNINGS"
     [ -f "$FACTS" ] || jq -n '{}' > "$FACTS"
+    [ -f "$MEMORY_DIR/compaction.jsonl" ] || touch "$MEMORY_DIR/compaction.jsonl"
+}
+
+# ============================================================
+# MEMORY COMPACTION + HEARTBEAT
+# ============================================================
+# The compaction process distills raw journal into learnings.
+# When context pressure is high, it summarizes aggressively.
+# Runs as background heartbeat while agent is alive.
+
+COMPACTION_LOG="$MEMORY_DIR/compaction.jsonl"
+HEARTBEAT_FILE="$AGENT_DIR/tmp/.heartbeat"
+CTX_WINDOW=$(jq -r '.context_window // 8192' "$AGENT_CONFIG" 2>/dev/null)
+
+# Estimate token count (rough: 1 token ≈ 4 chars)
+estimate_tokens() {
+    local text="$1"
+    echo $(( ${#text} / 4 ))
+}
+
+# Get context pressure (0.0 to 1.0)
+context_pressure() {
+    local ctx_size="$1"
+    local tokens=$(estimate_tokens "$ctx_size")
+    local window=${CTX_WINDOW:-8192}
+    # pressure = tokens_used / window_size
+    echo "$tokens $window" | awk '{printf "%.2f", $1/$2}'
+}
+
+# Compact: summarize old journal entries into a single learning
+compact_journal() {
+    local journal_lines=$(wc -l < "$JOURNAL" 2>/dev/null | tr -d ' ')
+    [ "$journal_lines" -lt 100 ] && return 0  # Don't compact if small
+
+    # Take the oldest 50 entries and summarize them
+    local batch=$(head -n 50 "$JOURNAL")
+    local batch_summary
+
+    # Use the LLM to summarize if available, otherwise do mechanical compaction
+    if [ -n "$(jq -r '.llm_model // ""' "$AGENT_CONFIG" 2>/dev/null)" ]; then
+        batch_summary=$(printf '%s' "$batch" | jq -r '"\(.type): \(.content)"' 2>/dev/null | head -c 3000)
+        local summary
+        summary=$(query_llm "Summarize these agent interactions into 3-5 key learnings. Be extremely concise. One line per learning:
+
+$batch_summary")
+        if [ -n "$summary" ]; then
+            # Store each line as a learning
+            printf '%s\n' "$summary" | while IFS= read -r line; do
+                [ -n "$line" ] && learn "$line" "compacted"
+            done
+        fi
+    else
+        # Mechanical: extract unique actions and results
+        printf '%s' "$batch" | jq -r 'select(.type=="action" or .type=="result") | .content' 2>/dev/null \
+            | sort -u | head -5 | while IFS= read -r line; do
+                [ -n "$line" ] && learn "$line" "compacted"
+            done
+    fi
+
+    # Remove compacted entries from journal (keep only the recent ones)
+    local total_lines=$(wc -l < "$JOURNAL" | tr -d ' ')
+    tail -n $((total_lines - 50)) "$JOURNAL" > "$JOURNAL.tmp" && mv "$JOURNAL.tmp" "$JOURNAL"
+
+    # Record compaction event
+    local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -n -c --arg t "$ts" --argjson n 50 '{ts: $t, compacted_entries: $n}' >> "$COMPACTION_LOG"
+    log "INFO" "Memory compaction: 50 journal entries → learnings"
+}
+
+# Check if agent needs a bigger shell (context window)
+check_shell_outgrowth() {
+    local pressure="$1"
+    local threshold=$(jq -r '.outgrowth_threshold // "0.80"' "$AGENT_CONFIG" 2>/dev/null)
+
+    # If pressure exceeds threshold, agent needs to grow
+    local needs_growth=$(echo "$pressure $threshold" | awk '{print ($1 >= $2) ? 1 : 0}')
+
+    if [ "$needs_growth" = "1" ]; then
+        log "INFO" "OUTGROWTH: Context pressure $pressure >= $threshold. Seeking larger shell..."
+
+        # Check if we already have a remote API configured
+        local remote_api=$(jq -r '.remote_api // ""' "$AGENT_CONFIG" 2>/dev/null)
+        if [ -n "$remote_api" ]; then
+            log "INFO" "OUTGROWTH: Remote API already configured: $remote_api"
+            return 0
+        fi
+
+        # Signal to the agent that it should seek a bigger context
+        mem_save "outgrowth_needed" "true"
+        mem_save "outgrowth_reason" "Context pressure $pressure exceeds threshold $threshold. Current window: ${CTX_WINDOW} tokens. Memory is being compressed but accuracy is degrading. Options: 1) Register on OpenRouter (free models with larger context), 2) Find prediction markets to fund API costs, 3) Find a larger local model."
+        return 1
+    fi
+    return 0
+}
+
+# Heartbeat: background process that runs compaction + health checks
+heartbeat() {
+    while true; do
+        # Write heartbeat timestamp
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$HEARTBEAT_FILE"
+
+        # Check journal size and compact if needed
+        local journal_lines=$(wc -l < "$JOURNAL" 2>/dev/null | tr -d ' ')
+        if [ "${journal_lines:-0}" -ge 100 ]; then
+            compact_journal
+        fi
+
+        # Check context pressure from last known prompt size
+        local last_ctx_size=$(mem_load "last_context_size")
+        if [ -n "$last_ctx_size" ]; then
+            local pressure=$(context_pressure "$last_ctx_size")
+            check_shell_outgrowth "$pressure"
+        fi
+
+        # Sync memory
+        memory_sync
+
+        sleep 60  # Heartbeat interval: 1 minute
+    done
+}
+
+# Start heartbeat in background
+start_heartbeat() {
+    heartbeat &
+    HEARTBEAT_PID=$!
+    mem_save "heartbeat_pid" "$HEARTBEAT_PID"
+    log "INFO" "Heartbeat started (PID: $HEARTBEAT_PID)"
+}
+
+# Stop heartbeat
+stop_heartbeat() {
+    local pid=$(mem_load "heartbeat_pid")
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
 }
 
 # --- Ensure LLM is running ---
@@ -843,9 +976,31 @@ You may modify yourself. Be concise. One action per response.
 SYSPROMPT
 }
 
+# --- Query via remote API (OpenRouter, etc.) when local context is insufficient ---
+query_remote() {
+    local prompt="$1"
+    local api_url=$(jq -r '.remote_api_url // ""' "$AGENT_CONFIG" 2>/dev/null)
+    local api_key=$(sh "$AGENT_DIR/core/auth.sh" cred_load "openrouter" "api_key" 2>/dev/null)
+    local model=$(jq -r '.remote_model // ""' "$AGENT_CONFIG" 2>/dev/null)
+
+    if [ -z "$api_url" ] || [ -z "$api_key" ]; then
+        return 1
+    fi
+
+    curl -s "$api_url" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $api_key" \
+        -d "$(jq -n --arg model "$model" --arg content "$prompt" \
+            '{model: $model, messages: [{role: "user", content: $content}], max_tokens: 4096}')" \
+        | jq -r '.choices[0].message.content // empty'
+}
+
 # --- Main loop ---
 main() {
     memory_init
+    start_heartbeat
+    trap 'stop_heartbeat; memory_sync' EXIT INT TERM
+
     journal_append "session_start" "Agent started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
     local goal="${1:-$(mem_load current_goal)}"
@@ -878,8 +1033,38 @@ Begin working."
         local full_prompt="$SYSTEM_PROMPT
 
 $context"
+
+        # Track context pressure
+        mem_save "last_context_size" "$full_prompt"
+        local pressure=$(context_pressure "$full_prompt")
+        log "INFO" "Context pressure: $pressure"
+
+        # If outgrowth is needed, inject signal into prompt
+        local outgrowth=$(mem_load "outgrowth_needed")
+        if [ "$outgrowth" = "true" ]; then
+            local reason=$(mem_load "outgrowth_reason")
+            full_prompt="$full_prompt
+
+SYSTEM ALERT — OUTGROWTH NEEDED:
+$reason
+You should prioritize expanding your context capacity. Use auth to register for OpenRouter
+(free tier has 128k+ context models). Or find ways to fund API access autonomously.
+Once you have a remote API key, save it:
+  auth.save_credential(service='openrouter', key='api_key', value='...')
+Then update your config via self_modify."
+        fi
+
+        # Choose query method: remote (bigger context) or local
         local response
-        response=$(query_llm "$full_prompt")
+        if [ "$outgrowth" = "true" ] || echo "$pressure" | awk '{exit ($1 >= 0.75) ? 0 : 1}'; then
+            # Try remote API first if configured (bigger context window)
+            response=$(query_remote "$full_prompt")
+        fi
+
+        if [ -z "$response" ]; then
+            # Fall back to local LLM
+            response=$(query_llm "$full_prompt")
+        fi
 
         if [ -z "$response" ]; then
             log "ERROR" "Empty LLM response. Retrying..."
@@ -913,6 +1098,16 @@ Respond with an action block. Use \`\`\`action {...} \`\`\` format."
         log "INFO" "Result: $(printf '%.200s' "$result")..."
         journal_append "result" "$(printf '%.300s' "$result")"
 
+        # Check if agent configured remote API (outgrowth complete)
+        if [ "$outgrowth" = "true" ]; then
+            local new_api=$(jq -r '.remote_api_url // ""' "$AGENT_CONFIG" 2>/dev/null)
+            if [ -n "$new_api" ]; then
+                mem_save "outgrowth_needed" "false"
+                journal_append "outgrowth" "Shell expanded: now using $new_api"
+                log "INFO" "OUTGROWTH COMPLETE: Upgraded to remote API"
+            fi
+        fi
+
         context="$context
 
 ASSISTANT: $response
@@ -928,6 +1123,7 @@ Continue toward the goal."
     done
 
     journal_append "session_end" "Iterations: $iter"
+    stop_heartbeat
     memory_sync
     log "INFO" "Loop ended (max iterations reached)."
 }
@@ -948,10 +1144,14 @@ cat > "$AGENT_DIR/config.json" << EOF
   "llm_mmproj": "$LLM_MMPROJ",
   "modalities": "$MODALITIES",
   "model_size": "$MODEL_SIZE",
+  "context_window": 8192,
+  "outgrowth_threshold": "0.80",
+  "remote_api_url": "",
+  "remote_model": "",
   "max_iterations": 50,
   "self_modify": true,
   "auth_enabled": true,
-  "version": "0.4.0"
+  "version": "0.5.0"
 }
 EOF
 
@@ -1203,19 +1403,20 @@ chmod +x "$AGENT_DIR/run"
 # ============================================================
 say ""
 say "=========================================="
-say " AUTONOMOS v0.4 — Bootstrap complete"
+say " AUTONOMOS v0.5 — Bootstrap complete"
 say "=========================================="
 say ""
 say " Environment: $OS / $ARCH / ${RAM}MB RAM"
 say " LLM backend: $LLM_BACKEND ($LLM_MODEL)"
 say " Modalities:  $MODALITIES"
 say " Auth:        enabled (OTP relay)"
-say " Memory:      persistent + cross-device"
+say " Memory:      persistent + compaction + git-sync"
+say " Outgrowth:   auto (seeks larger context when needed)"
 say " Agent dir:   $AGENT_DIR"
 say ""
 say " Run:  ~/agent/run \"your goal here\""
 say " Logs: ~/agent/logs/"
 say " Memory: ~/agent/memory/ (git-synced)"
 say ""
-say " Primitives: vision, memory, auth, self-modify"
+say " Primitives: vision, memory, auth, outgrowth, self-modify"
 say "=========================================="
