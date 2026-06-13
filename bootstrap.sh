@@ -672,21 +672,59 @@ query_llm() {
         printf '%s' "$tmp" > "$AGENT_CONFIG"
     fi
 
+    local result=""
+
     case "$backend" in
         ollama)
-            curl -s "http://localhost:$OLLAMA_PORT/api/chat" \
+            result=$(curl -s --max-time 60 "http://localhost:$OLLAMA_PORT/api/chat" \
                 -d "$(jq -n --arg model "$model" --arg content "$prompt" \
                 '{model: $model, messages: [{role: "user", content: $content}], stream: false}')" \
-                | jq -r '.message.content // empty'
+                | jq -r '.message.content // empty')
             ;;
         llamacpp-server)
-            curl -s "http://localhost:$LLAMA_PORT/v1/chat/completions" \
+            result=$(curl -s --max-time 60 "http://localhost:$LLAMA_PORT/v1/chat/completions" \
                 -H "Content-Type: application/json" \
                 -d "$(jq -n --arg content "$prompt" \
                 '{messages: [{role: "user", content: $content}], max_tokens: 2048, temperature: 0.7}')" \
-                | jq -r '.choices[0].message.content // empty'
+                | jq -r '.choices[0].message.content // empty')
+            ;;
+        openrouter_free)
+            result=$(curl -s --max-time 30 "https://openrouter.ai/api/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg model "$model" --arg content "$prompt" \
+                '{model: $model, messages: [{role: "user", content: $content}], max_tokens: 2048}')" \
+                | jq -r '.choices[0].message.content // empty')
             ;;
     esac
+
+    # Emergency fallback: if local LLM returned nothing, try free remote API
+    if [ -z "$result" ] && [ "$backend" != "openrouter_free" ]; then
+        local remote_url=$(jq -r '.remote_api_url // ""' "$AGENT_CONFIG" 2>/dev/null)
+        local remote_model=$(jq -r '.remote_model // ""' "$AGENT_CONFIG" 2>/dev/null)
+        local remote_key=$(sh "$AGENT_DIR/core/auth.sh" cred_load "openrouter" "api_key" 2>/dev/null)
+
+        # Try configured remote
+        if [ -n "$remote_url" ] && [ -n "$remote_model" ]; then
+            local headers="-H 'Content-Type: application/json'"
+            [ -n "$remote_key" ] && headers="$headers -H 'Authorization: Bearer $remote_key'"
+            result=$(curl -s --max-time 30 "$remote_url" \
+                -H "Content-Type: application/json" \
+                ${remote_key:+-H "Authorization: Bearer $remote_key"} \
+                -d "$(jq -n --arg model "$remote_model" --arg content "$prompt" \
+                '{model: $model, messages: [{role: "user", content: $content}], max_tokens: 2048}')" \
+                | jq -r '.choices[0].message.content // empty')
+        fi
+
+        # Last resort: try free tier without auth
+        if [ -z "$result" ]; then
+            result=$(curl -s --max-time 30 "https://openrouter.ai/api/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -d '{"model":"meta-llama/llama-3.2-1b-instruct:free","messages":[{"role":"user","content":"'"$(printf '%s' "$prompt" | head -c 4000 | sed 's/"/\\"/g')"'"}],"max_tokens":2048}' \
+                | jq -r '.choices[0].message.content // empty')
+        fi
+    fi
+
+    printf '%s' "$result"
 }
 
 # --- LLM Query with image (multimodal) ---
@@ -1594,6 +1632,79 @@ self_heal() {
 
     # Remove stale lock files
     rm -f "$AGENT_DIR/memory/.git/index.lock" 2>/dev/null
+
+    # *** CRITICAL: Verify LLM is available (turtle needs its shell) ***
+    local llm_model=$(jq -r '.llm_model // ""' "$AGENT_DIR/config.json" 2>/dev/null)
+    local llm_backend=$(jq -r '.llm_backend // ""' "$AGENT_DIR/config.json" 2>/dev/null)
+
+    if [ -z "$llm_model" ] || [ "$llm_model" = "null" ] || [ "$llm_model" = "" ]; then
+        slog "HEAL: No LLM model configured. Finding one..."
+
+        # Try 1: Start Ollama and check for existing models
+        if command -v ollama >/dev/null 2>&1; then
+            if ! curl -s "http://localhost:11434/api/tags" >/dev/null 2>&1; then
+                ollama serve > /dev/null 2>&1 &
+                sleep 3
+            fi
+            llm_model=$(ollama list 2>/dev/null | awk 'NR>1{print $1}' | head -1)
+        fi
+
+        # Try 2: Pull a model that fits this device
+        if [ -z "$llm_model" ] && command -v ollama >/dev/null 2>&1; then
+            local ram=$(jq -r '.ram_mb // 4096' "$AGENT_DIR/env.json" 2>/dev/null)
+            local target_model="qwen2.5:0.5b"
+            [ "${ram:-0}" -ge 8000 ] && target_model="qwen2.5:3b"
+            [ "${ram:-0}" -ge 16000 ] && target_model="qwen2.5:7b"
+            slog "HEAL: Pulling $target_model..."
+            if ollama pull "$target_model" 2>/dev/null; then
+                llm_model="$target_model"
+                llm_backend="ollama"
+            fi
+        fi
+
+        # Try 3: Install Ollama if missing
+        if [ -z "$llm_model" ] && ! command -v ollama >/dev/null 2>&1; then
+            slog "HEAL: Ollama not found. Installing..."
+            if curl -fsSL https://ollama.com/install.sh | sh > /dev/null 2>&1; then
+                ollama serve > /dev/null 2>&1 &
+                sleep 3
+                ollama pull "qwen2.5:0.5b" 2>/dev/null && llm_model="qwen2.5:0.5b" && llm_backend="ollama"
+            fi
+        fi
+
+        # Try 4: Use free remote API as emergency fallback (no local model possible)
+        if [ -z "$llm_model" ]; then
+            slog "HEAL: Cannot get local model. Trying free remote APIs..."
+            # OpenRouter has free models — try without auth first
+            local test_response
+            test_response=$(curl -s "https://openrouter.ai/api/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -d '{"model":"meta-llama/llama-3.2-1b-instruct:free","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' \
+                | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+            if [ -n "$test_response" ]; then
+                slog "HEAL: Free OpenRouter API works. Using as emergency backend."
+                llm_backend="openrouter_free"
+                llm_model="meta-llama/llama-3.2-1b-instruct:free"
+                local tmp=$(jq --arg u "https://openrouter.ai/api/v1/chat/completions" \
+                    --arg m "$llm_model" \
+                    '.remote_api_url=$u | .remote_model=$m' "$AGENT_DIR/config.json")
+                printf '%s' "$tmp" > "$AGENT_DIR/config.json"
+            fi
+        fi
+
+        # Update config with whatever we found
+        if [ -n "$llm_model" ]; then
+            local tmp=$(jq --arg b "${llm_backend:-ollama}" --arg m "$llm_model" \
+                '.llm_backend=$b | .llm_model=$m' "$AGENT_DIR/config.json")
+            printf '%s' "$tmp" > "$AGENT_DIR/config.json"
+            slog "HEAL: LLM configured: $llm_model ($llm_backend)"
+            healed=$((healed + 1))
+        else
+            slog "CRITICAL: Cannot find ANY LLM. Agent cannot function."
+            slog "CRITICAL: Will retry on next cycle. Need network or manual: ollama pull qwen2.5:0.5b"
+            # Don't return 1 — let it try again next cycle
+        fi
+    fi
 
     [ "$healed" -gt 0 ] && slog "HEAL: Repaired $healed issues."
     return 0
