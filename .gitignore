@@ -2,4 +2,5 @@
 models/
 logs/
 tmp/
+secrets/
 .DS_Store

@@ -559,6 +559,48 @@ exec_tool() {
                 echo "ERROR: screenshot failed"
             fi
             ;;
+        auth)
+            # Auth primitive: identity, email, OTP, credentials
+            local action=$(printf '%s' "$args" | jq -r '.action')
+            case "$action" in
+                get_phone)
+                    sh "$AGENT_DIR/core/auth.sh" get_phone
+                    ;;
+                get_email)
+                    sh "$AGENT_DIR/core/auth.sh" get_email
+                    ;;
+                set_email)
+                    local email=$(printf '%s' "$args" | jq -r '.email')
+                    sh "$AGENT_DIR/core/auth.sh" set_email "$email"
+                    ;;
+                create_email)
+                    local provider=$(printf '%s' "$args" | jq -r '.provider // "auto"')
+                    sh "$AGENT_DIR/core/auth.sh" create_email "$provider"
+                    ;;
+                request_otp)
+                    local service=$(printf '%s' "$args" | jq -r '.service')
+                    sh "$AGENT_DIR/core/auth.sh" request_otp "$service"
+                    ;;
+                save_credential)
+                    local svc=$(printf '%s' "$args" | jq -r '.service')
+                    local key=$(printf '%s' "$args" | jq -r '.key')
+                    local val=$(printf '%s' "$args" | jq -r '.value')
+                    sh "$AGENT_DIR/core/auth.sh" cred_save "$svc" "$key" "$val"
+                    ;;
+                load_credential)
+                    local svc=$(printf '%s' "$args" | jq -r '.service')
+                    local key=$(printf '%s' "$args" | jq -r '.key')
+                    sh "$AGENT_DIR/core/auth.sh" cred_load "$svc" "$key"
+                    ;;
+                register)
+                    local service=$(printf '%s' "$args" | jq -r '.service')
+                    sh "$AGENT_DIR/core/auth.sh" register "$service"
+                    ;;
+                *)
+                    echo "Auth actions: get_phone, get_email, set_email, create_email, request_otp, save_credential, load_credential, register"
+                    ;;
+            esac
+            ;;
         self_modify)
             local file=$(printf '%s' "$args" | jq -r '.file')
             local content=$(printf '%s' "$args" | jq -r '.content')
@@ -599,7 +641,7 @@ build_system_prompt() {
     fi
 
     cat << SYSPROMPT
-You are an autonomous multimodal agent running locally. OS: $os. Arch: $arch.
+You are Autonomos, an autonomous multimodal agent running locally. OS: $os. Arch: $arch.
 Modalities: $modalities.
 
 You execute actions by responding with:
@@ -613,9 +655,20 @@ Tools:
 - write_file: {"path": "...", "content": "..."}
 - list_dir: {"path": "..."}
 $vision_tools
+- auth: {"action": "<cmd>", ...} — Authentication primitive:
+    get_phone — your owner's phone number (for MFA/OTP)
+    get_email — your current email identity
+    create_email {"provider": "auto|temp|proton"} — create a new email for yourself
+    set_email {"email": "..."} — set your email
+    request_otp {"service": "..."} — trigger OTP and wait for code from owner's phone
+    save_credential {"service": "...", "key": "...", "value": "..."}
+    load_credential {"service": "...", "key": "..."}
+    register {"service": "..."} — begin service registration
 - self_modify: {"file": "core/agent.sh", "content": "..."}
 - done: {"summary": "..."}
 
+You have auth-as-a-primitive. You can create your own email, register for services,
+and request OTP codes sent to your owner's phone. Use this to be fully autonomous.
 Your source is at: $AGENT_DIR/core/
 You may modify yourself. Be concise. One action per response.
 SYSPROMPT
@@ -708,9 +761,217 @@ cat > "$AGENT_DIR/config.json" << EOF
   "model_size": "$MODEL_SIZE",
   "max_iterations": 50,
   "self_modify": true,
-  "version": "0.2.0"
+  "auth_enabled": true,
+  "version": "0.3.0"
 }
 EOF
+
+# ============================================================
+# PHASE 5b: Auth primitive — secrets store
+# ============================================================
+say "Setting up auth primitive..."
+mkdir -p "$AGENT_DIR/secrets"
+chmod 700 "$AGENT_DIR/secrets"
+
+# Create secrets file if it doesn't exist (never overwrite)
+if [ ! -f "$AGENT_DIR/secrets/identity.json" ]; then
+    cat > "$AGENT_DIR/secrets/identity.json" << 'SECRETS_EOF'
+{
+  "owner_phone": "8012306770",
+  "owner_phone_formatted": "+1-801-230-6770",
+  "agent_name": "autonomos",
+  "auth_method": "otp_relay",
+  "email": null,
+  "email_provider": null,
+  "credentials": {}
+}
+SECRETS_EOF
+    chmod 600 "$AGENT_DIR/secrets/identity.json"
+    say "  Created identity store at ~/agent/secrets/identity.json"
+else
+    say "  Identity store already exists, preserving."
+fi
+
+# Create the auth helper script
+cat > "$AGENT_DIR/core/auth.sh" << 'AUTH_CORE'
+#!/bin/sh
+# ============================================================
+# AUTONOMOS AUTH PRIMITIVE
+# ============================================================
+# Provides: identity management, email creation, OTP relay,
+# credential storage, and service registration.
+# ============================================================
+
+AGENT_DIR="${AGENT_DIR:-$HOME/agent}"
+SECRETS="$AGENT_DIR/secrets/identity.json"
+CRED_DIR="$AGENT_DIR/secrets/credentials"
+
+mkdir -p "$CRED_DIR"
+
+# --- Read identity ---
+get_phone() { jq -r '.owner_phone // empty' "$SECRETS" 2>/dev/null; }
+get_email() { jq -r '.email // empty' "$SECRETS" 2>/dev/null; }
+get_agent_name() { jq -r '.agent_name // "autonomos"' "$SECRETS" 2>/dev/null; }
+
+# --- Store credentials ---
+cred_save() {
+    local service="$1" key="$2" value="$3"
+    local file="$CRED_DIR/${service}.json"
+    if [ -f "$file" ]; then
+        local tmp=$(jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$file")
+        printf '%s' "$tmp" > "$file"
+    else
+        jq -n --arg k "$key" --arg v "$value" '{($k): $v}' > "$file"
+    fi
+    chmod 600 "$file"
+    echo "OK: saved $key for $service"
+}
+
+cred_load() {
+    local service="$1" key="$2"
+    local file="$CRED_DIR/${service}.json"
+    [ -f "$file" ] && jq -r --arg k "$key" '.[$k] // empty' "$file" 2>/dev/null
+}
+
+# --- OTP Relay ---
+# On Termux: can auto-read SMS. On other platforms: prompts user.
+request_otp() {
+    local service="$1"
+    local os=$(jq -r '.os' "$AGENT_DIR/env.json" 2>/dev/null)
+
+    echo "[AUTH] OTP requested for: $service"
+    echo "[AUTH] Waiting for code sent to $(get_phone)..."
+
+    case "$os" in
+        termux)
+            # Auto-read OTP from SMS on Android
+            sleep 5  # Wait for SMS to arrive
+            local attempts=0
+            while [ "$attempts" -lt 12 ]; do
+                # Get most recent SMS, look for OTP pattern
+                local sms=$(termux-sms-list -l 3 -t inbox 2>/dev/null | jq -r '.[].body' 2>/dev/null)
+                local code=$(printf '%s' "$sms" | grep -oE '[0-9]{4,8}' | head -1)
+                if [ -n "$code" ]; then
+                    echo "$code"
+                    return 0
+                fi
+                sleep 5
+                attempts=$((attempts + 1))
+            done
+            echo "[AUTH] ERROR: Timed out waiting for OTP SMS"
+            return 1
+            ;;
+        *)
+            # Interactive: prompt user for OTP
+            printf '[AUTH] Enter OTP code sent to %s: ' "$(get_phone)"
+            read -r code
+            if [ -n "$code" ]; then
+                echo "$code"
+                return 0
+            fi
+            echo "[AUTH] ERROR: No code provided"
+            return 1
+            ;;
+    esac
+}
+
+# --- Email creation ---
+# Strategy: use temp email APIs or create via CLI mail providers
+create_email() {
+    local preferred_provider="$1"
+    local agent_name=$(get_agent_name)
+    local timestamp=$(date +%s)
+
+    case "$preferred_provider" in
+        proton)
+            # Proton requires manual setup, store if already created
+            echo "[AUTH] Proton email must be created manually."
+            echo "[AUTH] Once created, run: ~/agent/core/auth.sh set_email <email>"
+            return 1
+            ;;
+        tutanota)
+            echo "[AUTH] Tutanota email must be created manually."
+            return 1
+            ;;
+        temp|disposable)
+            # Use a temporary email API
+            local email
+            email=$(curl -s "https://api.mail.tm/accounts" \
+                -H "Content-Type: application/json" \
+                -d "{\"address\": \"${agent_name}${timestamp}@mailto.plus\", \"password\": \"$(head -c 16 /dev/urandom | base64 | tr -d '/+=')\"}" \
+                | jq -r '.address // empty' 2>/dev/null)
+            if [ -n "$email" ]; then
+                # Store the email in identity
+                local tmp=$(jq --arg e "$email" '.email = $e | .email_provider = "mail.tm"' "$SECRETS")
+                printf '%s' "$tmp" > "$SECRETS"
+                echo "$email"
+                return 0
+            fi
+            ;;
+        *)
+            # Auto-select: try mail.tm first
+            create_email "temp"
+            return $?
+            ;;
+    esac
+    echo "[AUTH] Could not create email."
+    return 1
+}
+
+# --- Set email manually ---
+set_email() {
+    local email="$1"
+    local tmp=$(jq --arg e "$email" '.email = $e' "$SECRETS")
+    printf '%s' "$tmp" > "$SECRETS"
+    echo "OK: email set to $email"
+}
+
+# --- Register for a service ---
+register() {
+    local service="$1"
+    local email=$(get_email)
+
+    if [ -z "$email" ]; then
+        echo "[AUTH] No email configured. Creating one..."
+        email=$(create_email)
+        if [ -z "$email" ]; then
+            echo "[AUTH] ERROR: Cannot register without email."
+            return 1
+        fi
+    fi
+
+    echo "[AUTH] Ready to register for $service"
+    echo "[AUTH] Email: $email"
+    echo "[AUTH] Phone (MFA): $(get_phone)"
+    echo "[AUTH] Use the agent shell tool to complete registration via curl/browser."
+}
+
+# --- CLI interface ---
+case "${1:-help}" in
+    get_phone)    get_phone ;;
+    get_email)    get_email ;;
+    set_email)    set_email "$2" ;;
+    create_email) create_email "${2:-auto}" ;;
+    request_otp)  request_otp "$2" ;;
+    cred_save)    cred_save "$2" "$3" "$4" ;;
+    cred_load)    cred_load "$2" "$3" ;;
+    register)     register "$2" ;;
+    help|*)
+        echo "Usage: auth.sh <command> [args]"
+        echo "Commands:"
+        echo "  get_phone              - Get owner phone number"
+        echo "  get_email              - Get agent email"
+        echo "  set_email <email>      - Set agent email"
+        echo "  create_email [provider]- Create a new email (auto|temp|proton)"
+        echo "  request_otp <service>  - Request and wait for OTP code"
+        echo "  cred_save <svc> <k> <v>- Save a credential"
+        echo "  cred_load <svc> <key>  - Load a credential"
+        echo "  register <service>     - Begin registration flow"
+        ;;
+esac
+AUTH_CORE
+
+chmod +x "$AGENT_DIR/core/auth.sh"
 
 # ============================================================
 # PHASE 6: Launcher
@@ -727,16 +988,17 @@ chmod +x "$AGENT_DIR/run"
 # ============================================================
 say ""
 say "=========================================="
-say " AUTONOMOS v0.2 — Bootstrap complete"
+say " AUTONOMOS v0.3 — Bootstrap complete"
 say "=========================================="
 say ""
 say " Environment: $OS / $ARCH / ${RAM}MB RAM"
 say " LLM backend: $LLM_BACKEND ($LLM_MODEL)"
 say " Modalities:  $MODALITIES"
+say " Auth:        enabled (OTP relay)"
 say " Agent dir:   $AGENT_DIR"
 say ""
 say " Run:  ~/agent/run \"your goal here\""
 say " Logs: ~/agent/logs/"
 say ""
-say " Vision tools: camera, screenshot, see"
+say " Primitives: vision, auth, self-modify"
 say "=========================================="
