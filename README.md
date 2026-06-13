@@ -59,24 +59,40 @@ That's it. The script will:
 └── tmp/             # Scratch space
 ```
 
-## Model Selection (automatic)
+## Model Selection (automatic, multimodal-first)
 
-| RAM | Model | Size |
-|-----|-------|------|
-| <4GB | qwen2.5:0.5b | ~400MB |
-| 4-8GB | qwen2.5:1.5b | ~1GB |
-| 8-16GB | qwen2.5:3b | ~2GB |
-| 16GB+ | qwen2.5:7b | ~4.5GB |
+| RAM | Model | Modalities | Size |
+|-----|-------|-----------|------|
+| <2GB | qwen2.5:0.5b | text | ~400MB |
+| 2-4GB | SmolVLM 500M | vision, text | ~350MB |
+| 4-6GB | SmolVLM2 2.2B | vision, text | ~1.5GB |
+| 6-8GB | Gemma 4 E4B | vision, audio, text | ~3GB |
+| 8-16GB | Qwen2.5-VL 3B | vision, text | ~2GB |
+| 16GB+ | Qwen2.5-VL 7B | vision, text | ~4.5GB |
+
+All models except the text-only fallback support **native vision** — the agent can see.
 
 ## Agent Capabilities
 
 The agent can:
+- **See** — analyze images via the local multimodal model
+- **Camera** — capture photos (Termux camera API / imagesnap / ffmpeg)
+- **Screenshot** — capture screen contents
 - Execute shell commands
 - Read/write files
 - List directories
 - Modify its own source code
 - Persist memory across runs
 - Install new tools and packages via shell
+
+## Vision Tools
+
+```sh
+# The agent can use these autonomously:
+~/agent/run "take a photo and describe what you see"
+~/agent/run "screenshot my desktop and tell me what apps are open"
+~/agent/run "look at ~/photos/receipt.jpg and extract the total"
+```
 
 ## License
 
