@@ -231,13 +231,13 @@ fi
 if [ "$LLM_BACKEND" = "ollama" ]; then
     LLM_MODEL="$OLLAMA_MODEL"
     say "  Pulling model: $LLM_MODEL (this may take a while)..."
-    ollama pull "$LLM_MODEL" >> "$LOG_FILE" 2>&1 || {
+    ollama pull "$LLM_MODEL" 2>> "$LOG_FILE" || {
         # Fallback: try pulling without tag specifics
         say "  Primary pull failed, trying alternate tags..."
         case "$MODEL_SIZE" in
-            omni-7b)   ollama pull "qwen2.5-vl:7b" >> "$LOG_FILE" 2>&1 && LLM_MODEL="qwen2.5-vl:7b" ;;
-            omni-3b)   ollama pull "qwen2.5-vl:3b" >> "$LOG_FILE" 2>&1 && LLM_MODEL="qwen2.5-vl:3b" ;;
-            gemma4-e4b) ollama pull "gemma4" >> "$LOG_FILE" 2>&1 && LLM_MODEL="gemma4" ;;
+            omni-7b)   ollama pull "qwen2.5-vl:7b" 2>> "$LOG_FILE" && LLM_MODEL="qwen2.5-vl:7b" ;;
+            omni-3b)   ollama pull "qwen2.5-vl:3b" 2>> "$LOG_FILE" && LLM_MODEL="qwen2.5-vl:3b" ;;
+            gemma4-e4b) ollama pull "gemma4" 2>> "$LOG_FILE" && LLM_MODEL="gemma4" ;;
             *)         err "  Model pull failed. Agent will retry on first run." ;;
         esac
     }
