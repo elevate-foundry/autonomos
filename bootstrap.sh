@@ -366,9 +366,98 @@ log() {
     echo "$msg" >> "$LOG_DIR/$(date +%Y-%m-%d).log"
 }
 
-# --- Memory ---
+# --- Memory (persistent, append-only, cross-session) ---
+JOURNAL="$MEMORY_DIR/journal.jsonl"
+LEARNINGS="$MEMORY_DIR/learnings.jsonl"
+FACTS="$MEMORY_DIR/facts.json"
+
 mem_save() { printf '%s' "$2" > "$MEMORY_DIR/$1"; }
 mem_load() { [ -f "$MEMORY_DIR/$1" ] && cat "$MEMORY_DIR/$1" || echo ""; }
+
+# Append to permanent journal (never deleted, never overwritten)
+journal_append() {
+    local entry_type="$1" content="$2"
+    local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -n -c --arg t "$ts" --arg type "$entry_type" --arg c "$content" \
+        '{ts: $t, type: $type, content: $c}' >> "$JOURNAL"
+}
+
+# Store a learned fact permanently
+learn() {
+    local fact="$1" category="${2:-general}"
+    local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -n -c --arg t "$ts" --arg cat "$category" --arg f "$fact" \
+        '{ts: $t, category: $cat, fact: $f}' >> "$LEARNINGS"
+}
+
+# Recall recent journal entries (last N)
+journal_recent() {
+    local n="${1:-20}"
+    [ -f "$JOURNAL" ] && tail -n "$n" "$JOURNAL" || echo ""
+}
+
+# Recall all learnings (or filter by category)
+recall_learnings() {
+    local category="$1"
+    if [ -z "$category" ]; then
+        [ -f "$LEARNINGS" ] && cat "$LEARNINGS" || echo ""
+    else
+        [ -f "$LEARNINGS" ] && grep "\"category\":\"$category\"" "$LEARNINGS" || echo ""
+    fi
+}
+
+# Build memory context for prompt injection
+build_memory_context() {
+    local ctx=""
+
+    # Always include learnings (distilled knowledge)
+    local learnings
+    learnings=$(recall_learnings | tail -n 50 | jq -r '.fact' 2>/dev/null | head -c 2000)
+    if [ -n "$learnings" ]; then
+        ctx="PERMANENT MEMORY (things you have learned):
+$learnings
+"
+    fi
+
+    # Include recent journal for continuity
+    local recent
+    recent=$(journal_recent 10 | jq -r '"\(.type): \(.content)"' 2>/dev/null | head -c 1500)
+    if [ -n "$recent" ]; then
+        ctx="${ctx}
+RECENT HISTORY (last session context):
+$recent
+"
+    fi
+
+    # Include any saved facts
+    if [ -f "$FACTS" ]; then
+        local facts
+        facts=$(jq -r 'to_entries[] | "\(.key): \(.value)"' "$FACTS" 2>/dev/null | head -c 500)
+        if [ -n "$facts" ]; then
+            ctx="${ctx}
+KEY FACTS:
+$facts
+"
+        fi
+    fi
+
+    printf '%s' "$ctx"
+}
+
+# Sync memory to git (cross-device persistence)
+memory_sync() {
+    if [ -d "$MEMORY_DIR/.git" ]; then
+        (cd "$MEMORY_DIR" && git add -A && git commit -m "memory: $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null && git push 2>/dev/null) &
+    fi
+}
+
+# Initialize memory git repo if not present
+memory_init() {
+    mkdir -p "$MEMORY_DIR"
+    [ -f "$JOURNAL" ] || touch "$JOURNAL"
+    [ -f "$LEARNINGS" ] || touch "$LEARNINGS"
+    [ -f "$FACTS" ] || jq -n '{}' > "$FACTS"
+}
 
 # --- Ensure LLM is running ---
 ensure_llm() {
@@ -632,6 +721,44 @@ exec_tool() {
                     ;;
             esac
             ;;
+        memory)
+            # Persistent memory: learn, recall, journal, sync
+            local action=$(printf '%s' "$args" | jq -r '.action')
+            case "$action" in
+                learn)
+                    local fact=$(printf '%s' "$args" | jq -r '.fact')
+                    local category=$(printf '%s' "$args" | jq -r '.category // "general"')
+                    learn "$fact" "$category"
+                    echo "OK: learned [$category] $fact"
+                    ;;
+                recall)
+                    local category=$(printf '%s' "$args" | jq -r '.category // ""')
+                    recall_learnings "$category" | tail -n 20 | jq -r '.fact' 2>/dev/null
+                    ;;
+                journal)
+                    local n=$(printf '%s' "$args" | jq -r '.n // "10"')
+                    journal_recent "$n" | jq -r '"\(.ts) [\(.type)] \(.content)"' 2>/dev/null
+                    ;;
+                save_fact)
+                    local key=$(printf '%s' "$args" | jq -r '.key')
+                    local value=$(printf '%s' "$args" | jq -r '.value')
+                    local tmp=$(jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$FACTS")
+                    printf '%s' "$tmp" > "$FACTS"
+                    echo "OK: fact saved: $key = $value"
+                    ;;
+                get_fact)
+                    local key=$(printf '%s' "$args" | jq -r '.key')
+                    jq -r --arg k "$key" '.[$k] // "not found"' "$FACTS" 2>/dev/null
+                    ;;
+                sync)
+                    memory_sync
+                    echo "OK: memory synced"
+                    ;;
+                *)
+                    echo "Memory actions: learn, recall, journal, save_fact, get_fact, sync"
+                    ;;
+            esac
+            ;;
         self_modify)
             local file=$(printf '%s' "$args" | jq -r '.file')
             local content=$(printf '%s' "$args" | jq -r '.content')
@@ -643,6 +770,8 @@ exec_tool() {
             local summary=$(printf '%s' "$args" | jq -r '.summary // "Complete"')
             log "INFO" "DONE: $summary"
             mem_save "last_result" "$summary"
+            journal_append "done" "$summary"
+            memory_sync
             exit 0
             ;;
         *)
@@ -686,10 +815,17 @@ Tools:
 - write_file: {"path": "...", "content": "..."}
 - list_dir: {"path": "..."}
 $vision_tools
+- memory: {"action": "<cmd>", ...} — Permanent memory (persists forever):
+    learn {"fact": "...", "category": "..."} — store something you learned permanently
+    recall {"category": "..."} — recall all learned facts (optional category filter)
+    journal {"n": "10"} — review recent session history
+    save_fact {"key": "...", "value": "..."} — store a key-value fact
+    get_fact {"key": "..."} — retrieve a stored fact
+    sync — push memory to remote (cross-device)
 - auth: {"action": "<cmd>", ...} — Authentication primitive:
     get_phone — your owner's phone number (for MFA/OTP)
     get_email — your current email identity
-    create_email {"provider": "auto|temp|proton"} — create a new email for yourself
+    create_email — create a new email for yourself
     set_email {"email": "..."} — set your email
     request_otp {"service": "..."} — trigger OTP and wait for code from owner's phone
     save_credential {"service": "...", "key": "...", "value": "..."}
@@ -698,8 +834,10 @@ $vision_tools
 - self_modify: {"file": "core/agent.sh", "content": "..."}
 - done: {"summary": "..."}
 
-You have auth-as-a-primitive. You can create your own email, register for services,
-and request OTP codes sent to your owner's phone. Use this to be fully autonomous.
+IMPORTANT: You have permanent memory. Use memory.learn to store anything important
+you discover — preferences, system facts, past results, errors and fixes. This memory
+persists across all sessions and devices forever. Always learn from your experiences.
+You also have auth-as-a-primitive for full autonomy.
 Your source is at: $AGENT_DIR/core/
 You may modify yourself. Be concise. One action per response.
 SYSPROMPT
@@ -707,17 +845,26 @@ SYSPROMPT
 
 # --- Main loop ---
 main() {
+    memory_init
+    journal_append "session_start" "Agent started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
     local goal="${1:-$(mem_load current_goal)}"
     [ -z "$goal" ] && goal="Explore this system, report capabilities, and await instructions."
 
     log "INFO" "Agent starting. Goal: $goal"
     mem_save "current_goal" "$goal"
+    journal_append "goal" "$goal"
 
     local SYSTEM_PROMPT
     SYSTEM_PROMPT=$(build_system_prompt)
 
+    # Inject persistent memory into initial context
+    local memory_ctx
+    memory_ctx=$(build_memory_context)
+
     local context="GOAL: $goal
 
+${memory_ctx}
 System info:
 $(cat "$CONFIG")
 
@@ -741,6 +888,7 @@ $context"
         fi
 
         log "INFO" "LLM: $(printf '%.200s' "$response")..."
+        journal_append "llm_response" "$(printf '%.500s' "$response")"
 
         local action
         action=$(parse_action "$response")
@@ -758,9 +906,12 @@ Respond with an action block. Use \`\`\`action {...} \`\`\` format."
         local args=$(printf '%s' "$action" | jq -c '.args // {}')
 
         log "INFO" "Exec: $tool"
+        journal_append "action" "$tool: $(printf '%.200s' "$args")"
+
         local result
         result=$(exec_tool "$tool" "$args")
         log "INFO" "Result: $(printf '%.200s' "$result")..."
+        journal_append "result" "$(printf '%.300s' "$result")"
 
         context="$context
 
@@ -769,8 +920,15 @@ ASSISTANT: $response
 OBSERVATION: $result
 
 Continue toward the goal."
+
+        # Sync memory periodically (every 5 iterations)
+        if [ $((iter % 5)) -eq 0 ]; then
+            memory_sync
+        fi
     done
 
+    journal_append "session_end" "Iterations: $iter"
+    memory_sync
     log "INFO" "Loop ended (max iterations reached)."
 }
 
@@ -793,7 +951,7 @@ cat > "$AGENT_DIR/config.json" << EOF
   "max_iterations": 50,
   "self_modify": true,
   "auth_enabled": true,
-  "version": "0.3.0"
+  "version": "0.4.0"
 }
 EOF
 
@@ -1011,6 +1169,26 @@ AUTH_CORE
 chmod +x "$AGENT_DIR/core/auth.sh"
 
 # ============================================================
+# PHASE 5c: Persistent memory store
+# ============================================================
+say "Setting up persistent memory..."
+mkdir -p "$AGENT_DIR/memory"
+[ -f "$AGENT_DIR/memory/journal.jsonl" ] || touch "$AGENT_DIR/memory/journal.jsonl"
+[ -f "$AGENT_DIR/memory/learnings.jsonl" ] || touch "$AGENT_DIR/memory/learnings.jsonl"
+[ -f "$AGENT_DIR/memory/facts.json" ] || jq -n '{}' > "$AGENT_DIR/memory/facts.json"
+
+# Initialize memory as a git repo for cross-device sync
+if [ ! -d "$AGENT_DIR/memory/.git" ]; then
+    say "  Initializing memory git repo for cross-device sync..."
+    (cd "$AGENT_DIR/memory" && git init && git add -A && git commit -m "init: memory store" 2>/dev/null) >> "$LOG_FILE" 2>&1
+    say "  To sync across devices, add a remote:"
+    say "    cd ~/agent/memory && git remote add origin <your-private-repo-url>"
+else
+    say "  Memory repo exists. Pulling latest..."
+    (cd "$AGENT_DIR/memory" && git pull 2>/dev/null) >> "$LOG_FILE" 2>&1
+fi
+
+# ============================================================
 # PHASE 6: Launcher
 # ============================================================
 cat > "$AGENT_DIR/run" << 'LAUNCHER'
@@ -1025,17 +1203,19 @@ chmod +x "$AGENT_DIR/run"
 # ============================================================
 say ""
 say "=========================================="
-say " AUTONOMOS v0.3 — Bootstrap complete"
+say " AUTONOMOS v0.4 — Bootstrap complete"
 say "=========================================="
 say ""
 say " Environment: $OS / $ARCH / ${RAM}MB RAM"
 say " LLM backend: $LLM_BACKEND ($LLM_MODEL)"
 say " Modalities:  $MODALITIES"
 say " Auth:        enabled (OTP relay)"
+say " Memory:      persistent + cross-device"
 say " Agent dir:   $AGENT_DIR"
 say ""
 say " Run:  ~/agent/run \"your goal here\""
 say " Logs: ~/agent/logs/"
+say " Memory: ~/agent/memory/ (git-synced)"
 say ""
-say " Primitives: vision, auth, self-modify"
+say " Primitives: vision, memory, auth, self-modify"
 say "=========================================="
