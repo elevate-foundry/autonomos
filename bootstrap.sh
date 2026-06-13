@@ -8,7 +8,8 @@
 # Usage: curl -fsSL <url>/bootstrap.sh | sh
 # ============================================================
 
-set -e
+# NOTE: No set -e. This script must NEVER exit early.
+# Individual failures are handled gracefully. The agent must live.
 
 # --- Configuration (all derived, nothing hardcoded) ---
 AGENT_DIR="${AGENT_DIR:-$HOME/agent}"
@@ -229,32 +230,47 @@ else
 fi
 
 if [ "$LLM_BACKEND" = "ollama" ]; then
-    # Discover the best multimodal model available
-    say "  Discovering best multimodal model for ${MODEL_SIZE} budget..."
-    LLM_MODEL=$(discover_multimodal_model "$MODEL_SIZE")
-
-    if [ -z "$LLM_MODEL" ]; then
-        # No model discovered — search ollama for vision-capable models
-        say "  No local vision model found. Searching Ollama library..."
-        # Let ollama search and pick first result that mentions vision
-        LLM_MODEL=$(ollama search vision 2>/dev/null | awk 'NR==2{print $1}')
+    # Ensure Ollama is running
+    if ! curl -s "http://localhost:11434/api/tags" >/dev/null 2>&1; then
+        say "  Starting Ollama..."
+        ollama serve > /dev/null 2>&1 &
+        sleep 3
     fi
 
-    if [ -z "$LLM_MODEL" ]; then
-        # Still nothing — ask the user
-        say "  Could not auto-discover a multimodal model."
-        if [ -t 0 ] || [ -e /dev/tty ]; then
-            printf '  Enter an Ollama model name (or press Enter to skip): ' > /dev/tty
-            read -r LLM_MODEL < /dev/tty 2>/dev/null || LLM_MODEL=""
+    # Step 1: Check if we already have ANY model pulled
+    say "  Checking for existing models..."
+    LLM_MODEL=$(ollama list 2>/dev/null | awk 'NR>1{print $1}' | head -1)
+
+    if [ -n "$LLM_MODEL" ]; then
+        say "  Found existing model: $LLM_MODEL"
+    else
+        # Step 2: Pick the right text model for this device's RAM
+        # These are guaranteed to exist in Ollama's registry
+        case "$MODEL_SIZE" in
+            7b)  LLM_MODEL="qwen2.5:7b" ;;
+            4b)  LLM_MODEL="qwen2.5:3b" ;;
+            3b)  LLM_MODEL="qwen2.5:3b" ;;
+            2b)  LLM_MODEL="qwen2.5:1.5b" ;;
+            1b)  LLM_MODEL="qwen2.5:0.5b" ;;
+            *)   LLM_MODEL="qwen2.5:0.5b" ;;
+        esac
+
+        say "  Pulling model: $LLM_MODEL (this may take a while)..."
+        ollama pull "$LLM_MODEL" 2>> "$LOG_FILE"
+        if [ $? -ne 0 ]; then
+            # If that fails, try the smallest possible model
+            say "  Pull failed. Trying smallest model..."
+            LLM_MODEL="tinyllama"
+            ollama pull "$LLM_MODEL" 2>> "$LOG_FILE" || {
+                err "  CRITICAL: Cannot pull any model. Check network."
+                err "  Once online, run: ollama pull qwen2.5:0.5b"
+                # Don't exit — continue with empty model, supervisor will retry
+            }
         fi
     fi
 
+    # Detect modalities from model name
     if [ -n "$LLM_MODEL" ]; then
-        say "  Pulling model: $LLM_MODEL (this may take a while)..."
-        ollama pull "$LLM_MODEL" 2>> "$LOG_FILE" || {
-            err "  Model pull failed. You can manually run: ollama pull <model>"
-        }
-        # Detect modalities from model name/metadata
         case "$LLM_MODEL" in
             *vl*|*vision*|*vlm*|*smolvlm*|*llava*|*moondream*|*gemma*4*)
                 MODALITIES="vision,text" ;;
@@ -640,9 +656,20 @@ query_llm() {
     local backend=$(jq -r '.llm_backend // ""' "$AGENT_CONFIG" 2>/dev/null)
     local model=$(jq -r '.llm_model // ""' "$AGENT_CONFIG" 2>/dev/null)
 
-    if [ -z "$backend" ] || [ -z "$model" ]; then
-        echo "[ERROR] No LLM configured. Run bootstrap or set config.json manually."
-        return 1
+    # Self-heal: if no model configured, try to find or pull one
+    if [ -z "$backend" ] || [ -z "$model" ] || [ "$model" = "null" ]; then
+        backend="ollama"
+        # Check if Ollama has any model already
+        model=$(ollama list 2>/dev/null | awk 'NR>1{print $1}' | head -1)
+        if [ -z "$model" ]; then
+            # Pull smallest model automatically
+            log "INFO" "No model found. Auto-pulling qwen2.5:0.5b..."
+            ollama pull "qwen2.5:0.5b" > /dev/null 2>&1
+            model="qwen2.5:0.5b"
+        fi
+        # Update config so this doesn't repeat
+        local tmp=$(jq --arg b "$backend" --arg m "$model" '.llm_backend=$b | .llm_model=$m' "$AGENT_CONFIG")
+        printf '%s' "$tmp" > "$AGENT_CONFIG"
     fi
 
     case "$backend" in
@@ -1212,7 +1239,7 @@ cat > "$AGENT_DIR/config.json" << EOF
   "max_iterations": 50,
   "self_modify": true,
   "auth_enabled": true,
-  "version": "0.6.0"
+  "version": "0.7.0"
 }
 EOF
 
@@ -1734,7 +1761,7 @@ chmod +x "$AGENT_DIR/alive"
 # ============================================================
 say ""
 say "=========================================="
-say " AUTONOMOS v0.6 — Bootstrap complete"
+say " AUTONOMOS v0.7 — Bootstrap complete"
 say "=========================================="
 say ""
 say " Environment: $OS / $ARCH / ${RAM}MB RAM"
@@ -1748,8 +1775,89 @@ say " Agent dir:   $AGENT_DIR"
 say ""
 say " One-shot:  ~/agent/run \"your goal here\""
 say " Immortal:  ~/agent/alive \"your goal here\""
-say " Logs:      ~/agent/logs/"
-say " Memory:    ~/agent/memory/ (git-synced)"
+say " Kill:      kill \$(cat ~/agent/tmp/.supervisor.pid)"
 say ""
 say " Once alive, it stays alive. Forever."
 say "=========================================="
+
+# ============================================================
+# PHASE 7: Start alive + persistence across reboots
+# ============================================================
+
+# Ensure agent survives device reboots
+case "$OS" in
+    termux)
+        # Termux:Boot auto-start
+        mkdir -p "$HOME/.termux/boot"
+        cat > "$HOME/.termux/boot/autonomos" << BOOT
+#!/data/data/com.termux/files/usr/bin/sh
+sleep 5
+sh "$AGENT_DIR/alive" &
+BOOT
+        chmod +x "$HOME/.termux/boot/autonomos"
+        say ""
+        say " [Termux] Auto-start on boot configured."
+        say "   Install Termux:Boot from F-Droid for persistence."
+        ;;
+    macos)
+        # launchd plist for macOS persistence
+        PLIST="$HOME/Library/LaunchAgents/com.autonomos.agent.plist"
+        cat > "$PLIST" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autonomos.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>${AGENT_DIR}/core/supervisor.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${AGENT_DIR}/logs/supervisor.log</string>
+    <key>StandardErrorPath</key>
+    <string>${AGENT_DIR}/logs/supervisor.err</string>
+</dict>
+</plist>
+PLIST
+        say ""
+        say " [macOS] LaunchAgent installed for persistence."
+        say "   Agent will auto-start on login."
+        ;;
+    linux)
+        # systemd user service for Linux persistence
+        SYSTEMD_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$SYSTEMD_DIR"
+        cat > "$SYSTEMD_DIR/autonomos.service" << UNIT
+[Unit]
+Description=Autonomos Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh ${AGENT_DIR}/core/supervisor.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+        systemctl --user daemon-reload 2>/dev/null
+        systemctl --user enable autonomos.service 2>/dev/null
+        say ""
+        say " [Linux] systemd user service installed."
+        say "   Run: systemctl --user start autonomos"
+        ;;
+esac
+
+# Start the supervisor NOW (in background)
+say ""
+say " Starting agent supervisor..."
+nohup sh "$AGENT_DIR/core/supervisor.sh" "Explore this system, learn about your environment, and await instructions." > "$AGENT_DIR/logs/supervisor.log" 2>&1 &
+say " Agent is ALIVE. PID: $!"
+say ""
