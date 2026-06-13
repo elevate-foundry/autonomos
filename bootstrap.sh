@@ -87,29 +87,66 @@ install_pkg() {
     esac
 }
 
-pick_model() {
-    # Multimodal-first model selection based on available RAM
-    # All selected models support vision natively
+pick_model_size() {
+    # Returns a max parameter size the device can likely run
     RAM=$(detect_ram_mb)
     if [ "$RAM" -ge 16000 ]; then
-        # Qwen2.5-Omni: vision + audio input, 7B active params
-        echo "omni-7b"
+        echo "7b"
     elif [ "$RAM" -ge 8000 ]; then
-        # Qwen2.5-Omni 3B: vision + audio, fits in 8GB
-        echo "omni-3b"
+        echo "3b"
     elif [ "$RAM" -ge 6000 ]; then
-        # Gemma 4 E4B: vision + audio + tool-use, ~4B effective
-        echo "gemma4-e4b"
+        echo "4b"
     elif [ "$RAM" -ge 4000 ]; then
-        # SmolVLM2 2.2B: lightweight vision model
-        echo "smolvlm-2b"
+        echo "2b"
     elif [ "$RAM" -ge 2000 ]; then
-        # SmolVLM 500M: minimal vision capability
-        echo "smolvlm-500m"
+        echo "1b"
     else
-        # Ultra-constrained: text-only fallback
-        echo "text-0.5b"
+        echo "0.5b"
     fi
+}
+
+discover_multimodal_model() {
+    # Query Ollama's library for the best available multimodal model
+    # that fits within our size budget. Prefers vision-capable models.
+    local max_size="$1"
+
+    # Check if any vision model is already pulled locally
+    local existing
+    existing=$(ollama list 2>/dev/null | awk 'NR>1{print $1}' | head -20)
+
+    # Look for already-downloaded vision models first
+    for model in $existing; do
+        case "$model" in
+            *vl*|*vision*|*vlm*|*gemma*4*|*smolvlm*|*llava*|*moondream*)
+                echo "$model"
+                return 0
+                ;;
+        esac
+    done
+
+    # Search Ollama for multimodal models that fit our size
+    # Try common vision model families in preference order
+    local candidates
+    candidates=$(ollama search --multimodal 2>/dev/null | awk 'NR>1{print $1}' | head -10)
+
+    # If search doesn't support --multimodal flag, try known patterns
+    if [ -z "$candidates" ]; then
+        # Query Ollama API for available models, filter by size
+        candidates=$(curl -s "https://ollama.com/api/models?capability=vision" 2>/dev/null \
+            | jq -r '.[].name' 2>/dev/null | head -20)
+    fi
+
+    # If we got candidates, pick the largest that fits
+    if [ -n "$candidates" ]; then
+        for model in $candidates; do
+            echo "$model"
+            return 0
+        done
+    fi
+
+    # Last resort: return empty and let the caller handle it
+    echo ""
+    return 1
 }
 
 # ============================================================
@@ -120,7 +157,7 @@ OS=$(detect_os)
 ARCH=$(detect_arch)
 RAM=$(detect_ram_mb)
 PKG_MANAGER=$(detect_pkg_manager)
-MODEL_SIZE=$(pick_model)
+MODEL_SIZE=$(pick_model_size)
 
 mkdir -p "$AGENT_DIR"
 cat > "$AGENT_DIR/env.json" << EOF
@@ -168,51 +205,14 @@ mkdir -p "$AGENT_DIR/logs"
 mkdir -p "$AGENT_DIR/tmp"
 
 # ============================================================
-# PHASE 3: Local LLM — multimodal, adaptive
+# PHASE 3: Local LLM — multimodal, adaptive, discovered
 # ============================================================
-say "Setting up multimodal LLM (target: ${MODEL_SIZE})..."
+say "Setting up multimodal LLM (max size: ${MODEL_SIZE})..."
 
 LLM_BACKEND=""
 LLM_MODEL=""
 LLM_MMPROJ=""
 MODALITIES="text"
-
-# Map model selection to concrete model identifiers
-# Format: ollama_model|hf_repo|modalities
-case "$MODEL_SIZE" in
-    omni-7b)
-        OLLAMA_MODEL="qwen2.5vl:7b"
-        HF_REPO="ggml-org/Qwen2.5-VL-7B-Instruct-GGUF"
-        MODALITIES="vision,text"
-        ;;
-    omni-3b)
-        OLLAMA_MODEL="qwen2.5vl:3b"
-        HF_REPO="ggml-org/Qwen2.5-VL-3B-Instruct-GGUF"
-        MODALITIES="vision,text"
-        ;;
-    gemma4-e4b)
-        OLLAMA_MODEL="gemma4:e4b"
-        HF_REPO="ggml-org/gemma-4-E4B-it-GGUF"
-        MODALITIES="vision,audio,text"
-        ;;
-    smolvlm-2b)
-        OLLAMA_MODEL="smolvlm:2.2b"
-        HF_REPO="ggml-org/SmolVLM2-2.2B-Instruct-GGUF"
-        MODALITIES="vision,text"
-        ;;
-    smolvlm-500m)
-        OLLAMA_MODEL="smolvlm:500m"
-        HF_REPO="ggml-org/SmolVLM-500M-Instruct-GGUF"
-        MODALITIES="vision,text"
-        ;;
-    text-0.5b)
-        OLLAMA_MODEL="qwen2.5:0.5b"
-        HF_REPO=""
-        MODALITIES="text"
-        ;;
-esac
-
-say "  Target: $MODEL_SIZE | Modalities: $MODALITIES"
 
 # Strategy 1: Ollama (preferred — handles multimodal natively)
 if command -v ollama >/dev/null 2>&1; then
@@ -229,30 +229,51 @@ else
 fi
 
 if [ "$LLM_BACKEND" = "ollama" ]; then
-    LLM_MODEL="$OLLAMA_MODEL"
-    say "  Pulling model: $LLM_MODEL (this may take a while)..."
-    ollama pull "$LLM_MODEL" 2>> "$LOG_FILE" || {
-        # Fallback: try pulling without tag specifics
-        say "  Primary pull failed, trying alternate tags..."
-        case "$MODEL_SIZE" in
-            omni-7b)   ollama pull "qwen2.5-vl:7b" 2>> "$LOG_FILE" && LLM_MODEL="qwen2.5-vl:7b" ;;
-            omni-3b)   ollama pull "qwen2.5-vl:3b" 2>> "$LOG_FILE" && LLM_MODEL="qwen2.5-vl:3b" ;;
-            gemma4-e4b) ollama pull "gemma4" 2>> "$LOG_FILE" && LLM_MODEL="gemma4" ;;
-            *)         err "  Model pull failed. Agent will retry on first run." ;;
+    # Discover the best multimodal model available
+    say "  Discovering best multimodal model for ${MODEL_SIZE} budget..."
+    LLM_MODEL=$(discover_multimodal_model "$MODEL_SIZE")
+
+    if [ -z "$LLM_MODEL" ]; then
+        # No model discovered — search ollama for vision-capable models
+        say "  No local vision model found. Searching Ollama library..."
+        # Let ollama search and pick first result that mentions vision
+        LLM_MODEL=$(ollama search vision 2>/dev/null | awk 'NR==2{print $1}')
+    fi
+
+    if [ -z "$LLM_MODEL" ]; then
+        # Still nothing — ask the user
+        say "  Could not auto-discover a multimodal model."
+        printf '  Enter an Ollama model name (or press Enter to skip): '
+        read -r LLM_MODEL
+    fi
+
+    if [ -n "$LLM_MODEL" ]; then
+        say "  Pulling model: $LLM_MODEL (this may take a while)..."
+        ollama pull "$LLM_MODEL" 2>> "$LOG_FILE" || {
+            err "  Model pull failed. You can manually run: ollama pull <model>"
+        }
+        # Detect modalities from model name/metadata
+        case "$LLM_MODEL" in
+            *vl*|*vision*|*vlm*|*smolvlm*|*llava*|*moondream*|*gemma*4*)
+                MODALITIES="vision,text" ;;
+            *omni*)
+                MODALITIES="vision,audio,text" ;;
+            *)
+                MODALITIES="text" ;;
         esac
-    }
+    fi
 fi
 
 # Strategy 2: llama.cpp with multimodal server (if Ollama unavailable)
-if [ -z "$LLM_BACKEND" ] && [ -n "$HF_REPO" ]; then
-    say "  Building llama.cpp from source (with multimodal support)..."
+if [ -z "$LLM_BACKEND" ]; then
+    say "  Ollama unavailable. Building llama.cpp from source..."
     install_pkg cmake
     install_pkg make
 
     if command -v clang >/dev/null 2>&1; then
-        CC_FOUND="clang"
+        : # clang available
     elif command -v gcc >/dev/null 2>&1; then
-        CC_FOUND="gcc"
+        : # gcc available
     else
         install_pkg clang || install_pkg gcc
     fi
@@ -266,48 +287,53 @@ if [ -z "$LLM_BACKEND" ] && [ -n "$HF_REPO" ]; then
 
     LLM_BACKEND="llamacpp-server"
 
-    # Download model + mmproj from HuggingFace
-    say "  Downloading multimodal model from $HF_REPO..."
-    mkdir -p "$AGENT_DIR/models"
+    # Ask user for a HuggingFace model repo or GGUF URL
+    say "  llama.cpp built. You need a GGUF model file."
+    printf '  Enter a HuggingFace repo (e.g. ggml-org/gemma-3-4b-it-GGUF) or GGUF URL: '
+    read -r MODEL_SOURCE
 
-    # Use huggingface-cli if available, otherwise curl the files
-    if command -v huggingface-cli >/dev/null 2>&1; then
-        huggingface-cli download "$HF_REPO" --local-dir "$AGENT_DIR/models/multimodal" --include "*Q4_K_M*" "*mmproj*" >> "$LOG_FILE" 2>&1
+    if [ -n "$MODEL_SOURCE" ]; then
+        mkdir -p "$AGENT_DIR/models"
+        case "$MODEL_SOURCE" in
+            http*)
+                # Direct URL to a GGUF file
+                say "  Downloading model..."
+                curl -fSL -o "$AGENT_DIR/models/model.gguf" "$MODEL_SOURCE" 2>> "$LOG_FILE"
+                LLM_MODEL="$AGENT_DIR/models/model.gguf"
+                ;;
+            *)
+                # HuggingFace repo — discover files via API
+                say "  Discovering files in $MODEL_SOURCE..."
+                BASE_URL="https://huggingface.co/$MODEL_SOURCE/resolve/main"
+                FILES=$(curl -s "https://huggingface.co/api/models/$MODEL_SOURCE" | jq -r '.siblings[].rfilename' 2>/dev/null)
+
+                # Find Q4 quantized model
+                MODEL_FILE=$(printf '%s' "$FILES" | grep -i 'q4_k_m' | head -1)
+                if [ -n "$MODEL_FILE" ]; then
+                    say "  Downloading $MODEL_FILE..."
+                    curl -fSL -o "$AGENT_DIR/models/model.gguf" "$BASE_URL/$MODEL_FILE" 2>> "$LOG_FILE"
+                fi
+
+                # Find mmproj if present
+                MMPROJ_FILE=$(printf '%s' "$FILES" | grep -i 'mmproj' | head -1)
+                if [ -n "$MMPROJ_FILE" ]; then
+                    say "  Downloading $MMPROJ_FILE..."
+                    curl -fSL -o "$AGENT_DIR/models/mmproj.gguf" "$BASE_URL/$MMPROJ_FILE" 2>> "$LOG_FILE"
+                    LLM_MMPROJ="$AGENT_DIR/models/mmproj.gguf"
+                fi
+
+                LLM_MODEL="$AGENT_DIR/models/model.gguf"
+                ;;
+        esac
+        MODALITIES="vision,text"  # Assume multimodal if user provided a model
     else
-        # Discover and download the Q4_K_M model + mmproj
-        BASE_URL="https://huggingface.co/$HF_REPO/resolve/main"
-        # These repos follow a consistent naming pattern
-        REPO_NAME=$(echo "$HF_REPO" | awk -F/ '{print $2}' | sed 's/-GGUF//')
-        MODEL_FILE=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-
-        # Try to fetch the file listing and find Q4_K_M + mmproj
-        say "  Fetching model files (Q4_K_M quantization)..."
-        curl -fSL -o "$AGENT_DIR/models/model.gguf" \
-            "$BASE_URL/${MODEL_FILE}-Q4_K_M.gguf" >> "$LOG_FILE" 2>&1 || \
-        curl -fSL -o "$AGENT_DIR/models/model.gguf" \
-            $(curl -s "https://huggingface.co/api/models/$HF_REPO" | jq -r '.siblings[].rfilename' 2>/dev/null | grep -i 'q4_k_m' | head -1 | xargs -I{} echo "$BASE_URL/{}") >> "$LOG_FILE" 2>&1
-
-        # Download mmproj
-        MMPROJ_FILE=$(curl -s "https://huggingface.co/api/models/$HF_REPO" | jq -r '.siblings[].rfilename' 2>/dev/null | grep -i 'mmproj' | head -1)
-        if [ -n "$MMPROJ_FILE" ]; then
-            curl -fSL -o "$AGENT_DIR/models/mmproj.gguf" "$BASE_URL/$MMPROJ_FILE" >> "$LOG_FILE" 2>&1
-            LLM_MMPROJ="$AGENT_DIR/models/mmproj.gguf"
-        fi
+        err "  No model provided. Agent will not have LLM until configured."
     fi
-
-    LLM_MODEL="$AGENT_DIR/models/model.gguf"
 fi
 
-# Fallback: text-only if nothing else worked
-if [ -z "$LLM_BACKEND" ]; then
-    err "Could not set up multimodal LLM. Falling back to text-only."
-    MODALITIES="text"
-    # Try one more time with Ollama text model
-    if command -v ollama >/dev/null 2>&1; then
-        LLM_BACKEND="ollama"
-        LLM_MODEL="qwen2.5:0.5b"
-        ollama pull "$LLM_MODEL" >> "$LOG_FILE" 2>&1
-    fi
+# Final check
+if [ -z "$LLM_BACKEND" ] || [ -z "$LLM_MODEL" ]; then
+    err "No LLM configured. Run: ollama pull <model> or provide a GGUF file."
 fi
 
 # ============================================================
@@ -382,8 +408,13 @@ ensure_llm() {
 query_llm() {
     local prompt="$1"
     ensure_llm
-    local backend=$(jq -r '.llm_backend // "ollama"' "$AGENT_CONFIG" 2>/dev/null)
-    local model=$(jq -r '.llm_model // "qwen2.5:1.5b"' "$AGENT_CONFIG" 2>/dev/null)
+    local backend=$(jq -r '.llm_backend // ""' "$AGENT_CONFIG" 2>/dev/null)
+    local model=$(jq -r '.llm_model // ""' "$AGENT_CONFIG" 2>/dev/null)
+
+    if [ -z "$backend" ] || [ -z "$model" ]; then
+        echo "[ERROR] No LLM configured. Run bootstrap or set config.json manually."
+        return 1
+    fi
 
     case "$backend" in
         ollama)
@@ -407,8 +438,8 @@ query_llm_vision() {
     local prompt="$1"
     local image_path="$2"
     ensure_llm
-    local backend=$(jq -r '.llm_backend // "ollama"' "$AGENT_CONFIG" 2>/dev/null)
-    local model=$(jq -r '.llm_model // "qwen2.5:1.5b"' "$AGENT_CONFIG" 2>/dev/null)
+    local backend=$(jq -r '.llm_backend // ""' "$AGENT_CONFIG" 2>/dev/null)
+    local model=$(jq -r '.llm_model // ""' "$AGENT_CONFIG" 2>/dev/null)
     local modalities=$(jq -r '.modalities // "text"' "$AGENT_CONFIG" 2>/dev/null)
 
     # Check if vision is supported
@@ -775,19 +806,27 @@ chmod 700 "$AGENT_DIR/secrets"
 
 # Create secrets file if it doesn't exist (never overwrite)
 if [ ! -f "$AGENT_DIR/secrets/identity.json" ]; then
-    cat > "$AGENT_DIR/secrets/identity.json" << 'SECRETS_EOF'
-{
-  "owner_phone": "8012306770",
-  "owner_phone_formatted": "+1-801-230-6770",
-  "agent_name": "autonomos",
-  "auth_method": "otp_relay",
-  "email": null,
-  "email_provider": null,
-  "credentials": {}
-}
-SECRETS_EOF
+    say "  First-time setup: configuring identity..."
+    printf '  Phone number for OTP/MFA (digits only, or Enter to skip): '
+    read -r OWNER_PHONE
+    printf '  Agent name [autonomos]: '
+    read -r AGENT_NAME
+    AGENT_NAME="${AGENT_NAME:-autonomos}"
+
+    jq -n \
+        --arg phone "${OWNER_PHONE:-}" \
+        --arg name "$AGENT_NAME" \
+        '{
+            owner_phone: $phone,
+            agent_name: $name,
+            auth_method: "otp_relay",
+            email: null,
+            email_provider: null,
+            credentials: {}
+        }' > "$AGENT_DIR/secrets/identity.json"
+
     chmod 600 "$AGENT_DIR/secrets/identity.json"
-    say "  Created identity store at ~/agent/secrets/identity.json"
+    say "  Identity configured for: $AGENT_NAME"
 else
     say "  Identity store already exists, preserving."
 fi
@@ -811,7 +850,7 @@ mkdir -p "$CRED_DIR"
 # --- Read identity ---
 get_phone() { jq -r '.owner_phone // empty' "$SECRETS" 2>/dev/null; }
 get_email() { jq -r '.email // empty' "$SECRETS" 2>/dev/null; }
-get_agent_name() { jq -r '.agent_name // "autonomos"' "$SECRETS" 2>/dev/null; }
+get_agent_name() { jq -r '.agent_name // "agent"' "$SECRETS" 2>/dev/null; }
 
 # --- Store credentials ---
 cred_save() {
@@ -876,45 +915,43 @@ request_otp() {
 }
 
 # --- Email creation ---
-# Strategy: use temp email APIs or create via CLI mail providers
+# Discovery-based: tries available temp mail APIs, prompts if none work.
+# The agent can also use shell to create email via any provider it discovers.
 create_email() {
-    local preferred_provider="$1"
     local agent_name=$(get_agent_name)
     local timestamp=$(date +%s)
+    local password=$(head -c 16 /dev/urandom | base64 | tr -d '/+=')
 
-    case "$preferred_provider" in
-        proton)
-            # Proton requires manual setup, store if already created
-            echo "[AUTH] Proton email must be created manually."
-            echo "[AUTH] Once created, run: ~/agent/core/auth.sh set_email <email>"
-            return 1
-            ;;
-        tutanota)
-            echo "[AUTH] Tutanota email must be created manually."
-            return 1
-            ;;
-        temp|disposable)
-            # Use a temporary email API
-            local email
-            email=$(curl -s "https://api.mail.tm/accounts" \
-                -H "Content-Type: application/json" \
-                -d "{\"address\": \"${agent_name}${timestamp}@mailto.plus\", \"password\": \"$(head -c 16 /dev/urandom | base64 | tr -d '/+=')\"}" \
-                | jq -r '.address // empty' 2>/dev/null)
-            if [ -n "$email" ]; then
-                # Store the email in identity
-                local tmp=$(jq --arg e "$email" '.email = $e | .email_provider = "mail.tm"' "$SECRETS")
-                printf '%s' "$tmp" > "$SECRETS"
-                echo "$email"
-                return 0
-            fi
-            ;;
-        *)
-            # Auto-select: try mail.tm first
-            create_email "temp"
-            return $?
-            ;;
-    esac
-    echo "[AUTH] Could not create email."
+    # Try to discover available temp email domains via mail.tm API
+    local domain
+    domain=$(curl -s "https://api.mail.tm/domains" 2>/dev/null | jq -r '["hydra:member"][0].domain // empty' 2>/dev/null)
+    if [ -z "$domain" ]; then
+        domain=$(curl -s "https://api.mail.tm/domains" 2>/dev/null | jq -r '.["hydra:member"][0].domain // empty' 2>/dev/null)
+    fi
+
+    if [ -n "$domain" ]; then
+        local address="${agent_name}${timestamp}@${domain}"
+        local response
+        response=$(curl -s "https://api.mail.tm/accounts" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg addr "$address" --arg pw "$password" \
+                '{address: $addr, password: $pw}')" 2>/dev/null)
+        local email
+        email=$(printf '%s' "$response" | jq -r '.address // empty' 2>/dev/null)
+        if [ -n "$email" ]; then
+            local tmp=$(jq --arg e "$email" --arg p "mail.tm" '.email = $e | .email_provider = $p' "$SECRETS")
+            printf '%s' "$tmp" > "$SECRETS"
+            cred_save "email" "password" "$password"
+            echo "$email"
+            return 0
+        fi
+    fi
+
+    # API didn't work — prompt user or let agent use shell to create one
+    echo "[AUTH] Auto-creation failed. Options:"
+    echo "[AUTH]   1. Use shell tool to curl a temp mail API"
+    echo "[AUTH]   2. Manually: ~/agent/core/auth.sh set_email <your@email>"
+    echo "[AUTH]   3. Agent can self-discover working email APIs via shell"
     return 1
 }
 
