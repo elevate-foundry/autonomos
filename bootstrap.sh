@@ -345,8 +345,8 @@ exec_tool() {
 # --- Parse action from LLM response ---
 parse_action() {
     local response="$1"
-    # Extract JSON between ```action and ```
-    printf '%s' "$response" | sed -n '/```action/,/```/{/```/d;p}' | jq '.' 2>/dev/null
+    # Extract JSON between ```action and ``` (portable awk, works on BSD+GNU)
+    printf '%s' "$response" | awk '/```action/{found=1;next} /```/{if(found)exit} found{print}' | jq '.' 2>/dev/null
 }
 
 # --- System prompt ---
