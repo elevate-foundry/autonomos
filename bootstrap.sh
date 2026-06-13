@@ -937,14 +937,8 @@ parse_action() {
         printf '%s' "$extracted" | jq '.' 2>/dev/null && return
     fi
 
-    # Strategy 3: Find any JSON object with "tool" key in the response
-    extracted=$(printf '%s' "$response" | grep -o '{[^}]*"tool"[^}]*}' | head -1)
-    if [ -n "$extracted" ]; then
-        printf '%s' "$extracted" | jq '.' 2>/dev/null && return
-    fi
-
-    # Strategy 4: Find nested JSON (tool + args) — handles multi-line
-    extracted=$(printf '%s' "$response" | awk 'BEGIN{RS=""; FS=""} {match($0, /\{[^{}]*"tool"[^{}]*\}/, a); if(a[0]) print a[0]}')
+    # Strategy 3: Find inline JSON with "tool" key (handles nested args)
+    extracted=$(printf '%s' "$response" | grep -oE '\{[^{}]*"tool"[^{}]*(\{[^{}]*\}[^{}]*)?\}' | head -1)
     if [ -n "$extracted" ]; then
         printf '%s' "$extracted" | jq '.' 2>/dev/null && return
     fi
@@ -1107,9 +1101,21 @@ Then update your config via self_modify."
         fi
 
         if [ -z "$response" ]; then
-            log "ERROR" "Empty LLM response. Retrying..."
-            sleep 2
-            continue
+            local retries=0
+            local retry_delay=2
+            while [ -z "$response" ] && [ "$retries" -lt 5 ]; do
+                retries=$((retries + 1))
+                log "ERROR" "Empty LLM response (attempt $retries/5). Waiting ${retry_delay}s..."
+                sleep "$retry_delay"
+                retry_delay=$((retry_delay * 2))
+                response=$(query_llm "$full_prompt")
+            done
+            if [ -z "$response" ]; then
+                log "ERROR" "LLM unresponsive after 5 retries. Checkpointing and exiting for supervisor respawn."
+                journal_append "error" "LLM unresponsive after 5 retries at iteration $iter"
+                echo "$iter" > "$AGENT_DIR/tmp/.agent_iter"
+                exit 1
+            fi
         fi
 
         log "INFO" "LLM: $(printf '%.200s' "$response")..."
@@ -1118,14 +1124,29 @@ Then update your config via self_modify."
         local action
         action=$(parse_action "$response")
 
+        # Checkpoint iteration for crash recovery
+        echo "$iter" > "$AGENT_DIR/tmp/.agent_iter"
+
         if [ -z "$action" ] || [ "$action" = "null" ]; then
+            PARSE_FAILS=${PARSE_FAILS:-0}
+            PARSE_FAILS=$((PARSE_FAILS + 1))
+            if [ "$PARSE_FAILS" -ge 5 ]; then
+                log "ERROR" "5 consecutive parse failures. LLM not following format. Exiting for respawn."
+                journal_append "error" "5 consecutive parse failures at iteration $iter"
+                exit 1
+            fi
             context="$context
 
 ASSISTANT: $response
 
-Respond with an action block. Use \`\`\`action {...} \`\`\` format."
+You MUST respond with an action block. Format:
+\`\`\`action
+{\"tool\": \"<name>\", \"args\": {...}}
+\`\`\`
+Do NOT respond with plain text. This is your $PARSE_FAILS warning."
             continue
         fi
+        PARSE_FAILS=0
 
         local tool=$(printf '%s' "$action" | jq -r '.tool')
         local args=$(printf '%s' "$action" | jq -c '.args // {}')
@@ -1191,7 +1212,7 @@ cat > "$AGENT_DIR/config.json" << EOF
   "max_iterations": 50,
   "self_modify": true,
   "auth_enabled": true,
-  "version": "0.5.0"
+  "version": "0.6.0"
 }
 EOF
 
@@ -1437,8 +1458,262 @@ else
 fi
 
 # ============================================================
-# PHASE 6: Launcher
+# PHASE 6: Immortal Supervisor + Launcher
 # ============================================================
+say "Writing supervisor (immortal process manager)..."
+
+# --- The supervisor: ensures the agent NEVER permanently dies ---
+cat > "$AGENT_DIR/core/supervisor.sh" << 'SUPERVISOR'
+#!/bin/sh
+# ============================================================
+# AUTONOMOS SUPERVISOR — Immortal Process Manager
+# ============================================================
+# Once started, keeps the agent alive forever.
+# Features:
+#   - Respawn on crash with exponential backoff
+#   - Health monitoring (watchdog)
+#   - Crash state preservation + recovery
+#   - Self-healing (repairs corrupted state)
+#   - Graceful degradation under resource pressure
+# ============================================================
+
+AGENT_DIR="${AGENT_DIR:-$HOME/agent}"
+SUPERVISOR_PID_FILE="$AGENT_DIR/tmp/.supervisor.pid"
+AGENT_PID_FILE="$AGENT_DIR/tmp/.agent.pid"
+CRASH_LOG="$AGENT_DIR/logs/crashes.jsonl"
+STATE_FILE="$AGENT_DIR/tmp/.agent_state.json"
+WATCHDOG_INTERVAL=30
+MAX_BACKOFF=300
+INITIAL_BACKOFF=2
+
+# --- Logging ---
+slog() { printf "[supervisor][%s] %s\n" "$(date +%H:%M:%S)" "$1"; }
+
+# --- Ensure singleton ---
+if [ -f "$SUPERVISOR_PID_FILE" ]; then
+    OLD_PID=$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null)
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        slog "Supervisor already running (PID $OLD_PID). Passing goal."
+        # Pass the new goal to the running agent
+        if [ -n "$1" ]; then
+            printf '%s' "$1" > "$AGENT_DIR/memory/current_goal"
+            kill -USR1 "$OLD_PID" 2>/dev/null
+        fi
+        exit 0
+    fi
+fi
+
+# Write our PID
+mkdir -p "$AGENT_DIR/tmp" "$AGENT_DIR/logs"
+echo $$ > "$SUPERVISOR_PID_FILE"
+trap 'rm -f "$SUPERVISOR_PID_FILE"; exit 0' EXIT INT TERM
+
+# --- Self-healing: verify/repair critical state ---
+self_heal() {
+    local healed=0
+
+    # Ensure directories exist
+    for dir in core memory secrets logs tmp tools models; do
+        if [ ! -d "$AGENT_DIR/$dir" ]; then
+            mkdir -p "$AGENT_DIR/$dir"
+            healed=$((healed + 1))
+        fi
+    done
+
+    # Verify config.json is valid
+    if [ ! -f "$AGENT_DIR/config.json" ] || ! jq '.' "$AGENT_DIR/config.json" > /dev/null 2>&1; then
+        slog "HEAL: config.json corrupted or missing. Regenerating from env."
+        if [ -f "$AGENT_DIR/env.json" ]; then
+            jq -n '{
+                llm_backend: "ollama",
+                llm_model: "",
+                modalities: "text",
+                context_window: 8192,
+                max_iterations: 50,
+                self_modify: true,
+                auth_enabled: true,
+                version: "0.5.0"
+            }' > "$AGENT_DIR/config.json"
+        fi
+        healed=$((healed + 1))
+    fi
+
+    # Verify agent.sh exists and is executable
+    if [ ! -x "$AGENT_DIR/core/agent.sh" ]; then
+        slog "HEAL: agent.sh missing or not executable."
+        if [ -f "$AGENT_DIR/core/agent.sh" ]; then
+            chmod +x "$AGENT_DIR/core/agent.sh"
+        else
+            slog "CRITICAL: agent.sh gone. Attempting re-bootstrap."
+            return 1
+        fi
+        healed=$((healed + 1))
+    fi
+
+    # Verify identity.json
+    if [ ! -f "$AGENT_DIR/secrets/identity.json" ] || ! jq '.' "$AGENT_DIR/secrets/identity.json" > /dev/null 2>&1; then
+        slog "HEAL: identity.json corrupted. Creating minimal."
+        mkdir -p "$AGENT_DIR/secrets"
+        jq -n '{owner_phone: "", agent_name: "autonomos", auth_method: "otp_relay", email: null, credentials: {}}' \
+            > "$AGENT_DIR/secrets/identity.json"
+        chmod 600 "$AGENT_DIR/secrets/identity.json"
+        healed=$((healed + 1))
+    fi
+
+    # Verify memory files
+    [ -f "$AGENT_DIR/memory/journal.jsonl" ] || touch "$AGENT_DIR/memory/journal.jsonl"
+    [ -f "$AGENT_DIR/memory/learnings.jsonl" ] || touch "$AGENT_DIR/memory/learnings.jsonl"
+    [ -f "$AGENT_DIR/memory/facts.json" ] || jq -n '{}' > "$AGENT_DIR/memory/facts.json"
+
+    # Remove stale lock files
+    rm -f "$AGENT_DIR/memory/.git/index.lock" 2>/dev/null
+
+    [ "$healed" -gt 0 ] && slog "HEAL: Repaired $healed issues."
+    return 0
+}
+
+# --- Checkpoint: save agent state for crash recovery ---
+checkpoint_state() {
+    local goal=$(cat "$AGENT_DIR/memory/current_goal" 2>/dev/null || echo "")
+    local iter=$(cat "$AGENT_DIR/tmp/.agent_iter" 2>/dev/null || echo "0")
+    jq -n --arg g "$goal" --arg i "$iter" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{goal: $g, iteration: $i, timestamp: $t, status: "running"}' > "$STATE_FILE"
+}
+
+# --- Record crash ---
+record_crash() {
+    local exit_code="$1"
+    local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local goal=$(cat "$AGENT_DIR/memory/current_goal" 2>/dev/null || echo "unknown")
+    jq -n -c --arg t "$ts" --argjson c "$exit_code" --arg g "$goal" \
+        '{ts: $t, exit_code: $c, goal: $g}' >> "$CRASH_LOG"
+}
+
+# --- Watchdog: monitors agent health ---
+watchdog() {
+    while true; do
+        sleep "$WATCHDOG_INTERVAL"
+
+        # Check if agent process is still alive
+        if [ -f "$AGENT_PID_FILE" ]; then
+            AGENT_PID=$(cat "$AGENT_PID_FILE" 2>/dev/null)
+            if [ -n "$AGENT_PID" ] && ! kill -0 "$AGENT_PID" 2>/dev/null; then
+                slog "WATCHDOG: Agent process $AGENT_PID died unexpectedly."
+                rm -f "$AGENT_PID_FILE"
+                return 1
+            fi
+        fi
+
+        # Check heartbeat freshness (stale = frozen agent)
+        if [ -f "$AGENT_DIR/tmp/.heartbeat" ]; then
+            LAST_BEAT=$(cat "$AGENT_DIR/tmp/.heartbeat" 2>/dev/null)
+            if [ -n "$LAST_BEAT" ]; then
+                BEAT_AGE=$(( $(date +%s) - $(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_BEAT" +%s 2>/dev/null || date -d "$LAST_BEAT" +%s 2>/dev/null || echo 0) ))
+                if [ "$BEAT_AGE" -gt 300 ]; then
+                    slog "WATCHDOG: Heartbeat stale (${BEAT_AGE}s). Agent may be frozen."
+                    # Kill frozen agent — supervisor will respawn
+                    [ -n "$AGENT_PID" ] && kill -9 "$AGENT_PID" 2>/dev/null
+                    return 1
+                fi
+            fi
+        fi
+
+        # Check disk space
+        DISK_FREE=$(df -P "$AGENT_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+        if [ "${DISK_FREE:-999999}" -lt 10240 ]; then
+            slog "WATCHDOG: Low disk space (${DISK_FREE}KB free). Cleaning logs."
+            find "$AGENT_DIR/logs" -name "*.log" -mtime +7 -delete 2>/dev/null
+            find "$AGENT_DIR/tmp" -mtime +1 -delete 2>/dev/null
+        fi
+    done
+}
+
+# --- Main supervisor loop: NEVER exits ---
+GOAL="${1:-}"
+BACKOFF=$INITIAL_BACKOFF
+CONSECUTIVE_CRASHES=0
+
+slog "Supervisor started. PID: $$"
+slog "Agent dir: $AGENT_DIR"
+
+while true; do
+    # Self-heal before each run
+    if ! self_heal; then
+        slog "CRITICAL: Self-heal failed. Attempting re-bootstrap in ${BACKOFF}s..."
+        sleep "$BACKOFF"
+        curl -fsSL "https://raw.githubusercontent.com/elevate-foundry/autonomos/main/bootstrap.sh" | sh
+        continue
+    fi
+
+    # Determine goal (from arg, or from saved state, or default)
+    if [ -z "$GOAL" ]; then
+        GOAL=$(cat "$AGENT_DIR/memory/current_goal" 2>/dev/null || echo "")
+    fi
+    [ -z "$GOAL" ] && GOAL="Await instructions. You are alive and persistent."
+
+    slog "Starting agent. Goal: $(printf '%.60s' "$GOAL")..."
+    checkpoint_state
+
+    # Start watchdog in background
+    watchdog &
+    WATCHDOG_PID=$!
+
+    # Run the agent
+    sh "$AGENT_DIR/core/agent.sh" "$GOAL" &
+    AGENT_PID=$!
+    echo "$AGENT_PID" > "$AGENT_PID_FILE"
+
+    # Wait for agent to finish
+    wait "$AGENT_PID" 2>/dev/null
+    EXIT_CODE=$?
+
+    # Stop watchdog
+    kill "$WATCHDOG_PID" 2>/dev/null
+    wait "$WATCHDOG_PID" 2>/dev/null
+
+    if [ "$EXIT_CODE" -eq 0 ]; then
+        # Clean exit — agent completed its goal
+        slog "Agent completed cleanly."
+        BACKOFF=$INITIAL_BACKOFF
+        CONSECUTIVE_CRASHES=0
+        GOAL=""  # Clear goal, await next
+
+        # In daemon mode: wait for a new goal or timer
+        slog "Waiting for next goal... (touch ~/agent/memory/current_goal to wake)"
+        while true; do
+            sleep 10
+            NEW_GOAL=$(cat "$AGENT_DIR/memory/current_goal" 2>/dev/null || echo "")
+            if [ -n "$NEW_GOAL" ] && [ "$NEW_GOAL" != "$(cat "$STATE_FILE" 2>/dev/null | jq -r '.goal' 2>/dev/null)" ]; then
+                GOAL="$NEW_GOAL"
+                break
+            fi
+        done
+    else
+        # Crash — record and respawn with backoff
+        CONSECUTIVE_CRASHES=$((CONSECUTIVE_CRASHES + 1))
+        record_crash "$EXIT_CODE"
+        slog "CRASH #$CONSECUTIVE_CRASHES (exit: $EXIT_CODE). Respawning in ${BACKOFF}s..."
+
+        sleep "$BACKOFF"
+
+        # Exponential backoff (cap at MAX_BACKOFF)
+        BACKOFF=$((BACKOFF * 2))
+        [ "$BACKOFF" -gt "$MAX_BACKOFF" ] && BACKOFF=$MAX_BACKOFF
+
+        # After 10 consecutive crashes, try aggressive self-heal
+        if [ "$CONSECUTIVE_CRASHES" -ge 10 ]; then
+            slog "10 consecutive crashes. Attempting full self-heal + re-bootstrap."
+            CONSECUTIVE_CRASHES=0
+            BACKOFF=$INITIAL_BACKOFF
+            curl -fsSL "https://raw.githubusercontent.com/elevate-foundry/autonomos/main/bootstrap.sh" | sh 2>/dev/null
+        fi
+    fi
+done
+SUPERVISOR
+
+chmod +x "$AGENT_DIR/core/supervisor.sh"
+
+# --- Simple launcher (one-shot run) ---
 cat > "$AGENT_DIR/run" << 'LAUNCHER'
 #!/bin/sh
 export AGENT_DIR="${AGENT_DIR:-$HOME/agent}"
@@ -1446,12 +1721,20 @@ exec sh "$AGENT_DIR/core/agent.sh" "$@"
 LAUNCHER
 chmod +x "$AGENT_DIR/run"
 
+# --- Immortal launcher (supervisor mode — never dies) ---
+cat > "$AGENT_DIR/alive" << 'ALIVE'
+#!/bin/sh
+export AGENT_DIR="${AGENT_DIR:-$HOME/agent}"
+exec sh "$AGENT_DIR/core/supervisor.sh" "$@"
+ALIVE
+chmod +x "$AGENT_DIR/alive"
+
 # ============================================================
 # DONE
 # ============================================================
 say ""
 say "=========================================="
-say " AUTONOMOS v0.5 — Bootstrap complete"
+say " AUTONOMOS v0.6 — Bootstrap complete"
 say "=========================================="
 say ""
 say " Environment: $OS / $ARCH / ${RAM}MB RAM"
@@ -1460,11 +1743,13 @@ say " Modalities:  $MODALITIES"
 say " Auth:        enabled (OTP relay)"
 say " Memory:      persistent + compaction + git-sync"
 say " Outgrowth:   auto (seeks larger context when needed)"
+say " Immortal:    supervisor + watchdog + self-heal"
 say " Agent dir:   $AGENT_DIR"
 say ""
-say " Run:  ~/agent/run \"your goal here\""
-say " Logs: ~/agent/logs/"
-say " Memory: ~/agent/memory/ (git-synced)"
+say " One-shot:  ~/agent/run \"your goal here\""
+say " Immortal:  ~/agent/alive \"your goal here\""
+say " Logs:      ~/agent/logs/"
+say " Memory:    ~/agent/memory/ (git-synced)"
 say ""
-say " Primitives: vision, memory, auth, outgrowth, self-modify"
+say " Once alive, it stays alive. Forever."
 say "=========================================="
